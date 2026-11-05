@@ -1,0 +1,13 @@
+{
+  "name": "horror-tele-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "python3 build_serverless.py",
+    "deploy": "python3 build_serverless.py && tgcloud push",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@tgcloud/cli": "latest"
+  }
+}
