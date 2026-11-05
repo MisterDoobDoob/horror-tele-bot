@@ -1,0 +1,16 @@
+# Secrets: never commit real env files
+.env
+.env.*
+!.env.example
+
+# Telegram Serverless: generated config contains passkeys
+tgcloud/lib/config.js
+.tgcloud/
+.tgcloud-files.json
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
