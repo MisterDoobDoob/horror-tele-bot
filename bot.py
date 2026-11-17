@@ -6,8 +6,9 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib import parse, request
 
 
@@ -53,6 +54,34 @@ class Reply:
 
 
 DEFAULT_INVALID_REPLY = Reply(text="Invalid passkey ❌")
+DEFAULT_WELCOME_TEXT = "Welcome! The game hasn't started yet."
+
+VENUE_VIDEO_CALLBACK = "venue_video"
+VENUE_VIDEO_BUTTON = "🎬 How to get to the venue"
+WEBSITE_BUTTON = "🌐 Visit the website"
+
+
+@dataclass(frozen=True)
+class Launch:
+    """Pre-game behaviour, active until unlock_at."""
+
+    unlock_at: datetime  # timezone-aware
+    locked_reply: Reply  # replaces the invalid reply until unlock_at
+    welcome_text: str = DEFAULT_WELCOME_TEXT  # reply to /start until unlock_at
+    venue_video: Reply | None = None  # sent when the venue button is tapped
+    website_url: str | None = None
+
+    def welcome_markup(self) -> dict[str, Any] | None:
+        rows = []
+        if self.venue_video:
+            rows.append([{"text": VENUE_VIDEO_BUTTON, "callback_data": VENUE_VIDEO_CALLBACK}])
+        if self.website_url:
+            rows.append([{"text": WEBSITE_BUTTON, "url": self.website_url}])
+        return {"inline_keyboard": rows} if rows else None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class TelegramPasskeyBot:
@@ -61,12 +90,19 @@ class TelegramPasskeyBot:
         token: str,
         responses: dict[str, Reply],
         invalid_reply: Reply = DEFAULT_INVALID_REPLY,
+        launch: Launch | None = None,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._token = token
         self._responses = responses
         self._invalid_reply = invalid_reply
+        self._launch = launch
+        self._clock = clock
         self._base_url = f"https://api.telegram.org/bot{token}"
         self._offset = 0
+
+    def _is_locked(self) -> bool:
+        return self._launch is not None and self._clock() < self._launch.unlock_at
 
     async def _api_request(
         self,
@@ -90,16 +126,32 @@ class TelegramPasskeyBot:
     async def get_updates(self) -> list[dict[str, Any]]:
         result = await self._api_request(
             "getUpdates",
-            {"offset": self._offset, "timeout": 30, "allowed_updates": json.dumps(["message"])},
+            {
+                "offset": self._offset,
+                "timeout": 30,
+                "allowed_updates": json.dumps(["message", "callback_query"]),
+            },
         )
         if not result.get("ok"):
             raise RuntimeError(f"Telegram getUpdates failed: {result}")
         return result.get("result", [])
 
-    async def send_message(self, chat_id: int, text: str) -> None:
-        result = await self._api_request("sendMessage", {"chat_id": chat_id, "text": text})
+    async def send_message(
+        self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None
+    ) -> None:
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        result = await self._api_request("sendMessage", payload)
         if not result.get("ok"):
             raise RuntimeError(f"Telegram sendMessage failed: {result}")
+
+    async def answer_callback_query(self, callback_query_id: str) -> None:
+        result = await self._api_request(
+            "answerCallbackQuery", {"callback_query_id": callback_query_id}
+        )
+        if not result.get("ok"):
+            raise RuntimeError(f"Telegram answerCallbackQuery failed: {result}")
 
     async def send_file(
         self, chat_id: int, file: str, file_type: str, caption: str | None = None
@@ -138,6 +190,11 @@ class TelegramPasskeyBot:
         if isinstance(update_id, int):
             self._offset = update_id + 1
 
+        callback_query = update.get("callback_query")
+        if isinstance(callback_query, dict):
+            await self.handle_callback_query(callback_query)
+            return
+
         message = update.get("message")
         if not isinstance(message, dict):
             return
@@ -149,8 +206,36 @@ class TelegramPasskeyBot:
         if not isinstance(chat_id, int) or not isinstance(text, str):
             return
 
-        reply = self._responses.get(text.strip(), self._invalid_reply)
+        text = text.strip()
+        locked = self._is_locked()
+        if locked and self._launch and _is_start_command(text):
+            await self.send_message(
+                chat_id, self._launch.welcome_text, self._launch.welcome_markup()
+            )
+            return
+
+        reply = self._responses.get(text)
+        if reply is None:
+            reply = self._launch.locked_reply if locked and self._launch else self._invalid_reply
         await self.send_reply(chat_id, reply)
+
+    async def handle_callback_query(self, callback_query: dict[str, Any]) -> None:
+        query_id = callback_query.get("id")
+        if isinstance(query_id, str):
+            await self.answer_callback_query(query_id)  # stops the button's loading spinner
+
+        message = callback_query.get("message")
+        chat = message.get("chat") if isinstance(message, dict) else None
+        chat_id = chat.get("id") if isinstance(chat, dict) else None
+        if not isinstance(chat_id, int):
+            return
+
+        if (
+            callback_query.get("data") == VENUE_VIDEO_CALLBACK
+            and self._launch
+            and self._launch.venue_video
+        ):
+            await self.send_reply(chat_id, self._launch.venue_video)
 
     async def run(self) -> None:
         logging.info("Bot started with %d passkey(s)", len(self._responses))
@@ -162,6 +247,12 @@ class TelegramPasskeyBot:
             except Exception as error:  # pragma: no cover
                 logging.exception("Polling error: %s", error)
                 await asyncio.sleep(2)
+
+
+def _is_start_command(text: str) -> bool:
+    """True for /start, /start <payload> and /start@BotName."""
+    command = text.split(maxsplit=1)[0] if text else ""
+    return command.split("@", 1)[0] == "/start"
 
 
 def _resolve_local_file(value: str) -> Path | None:
@@ -274,6 +365,32 @@ def load_invalid_reply(env: Mapping[str, str] = os.environ) -> Reply:
     return reply or DEFAULT_INVALID_REPLY
 
 
+def load_launch(env: Mapping[str, str] = os.environ) -> Launch | None:
+    """Pre-game settings. None when UNLOCK_AT isn't set."""
+    raw = (env.get("UNLOCK_AT") or "").strip()
+    if not raw:
+        return None
+    try:
+        unlock_at = datetime.fromisoformat(raw)
+    except ValueError as error:
+        raise RuntimeError(f"UNLOCK_AT is not an ISO 8601 date-time: {raw}") from error
+    if unlock_at.tzinfo is None:
+        raise RuntimeError("UNLOCK_AT needs a timezone offset, e.g. 2026-11-18T14:00:00+08:00")
+
+    website_url = (env.get("WEBSITE_URL") or "").strip() or None
+    if website_url and not website_url.startswith(("http://", "https://")):
+        raise RuntimeError("WEBSITE_URL must start with http:// or https://")
+
+    locked = _load_reply(env, "LOCKED_RESPONSE", "LOCKED_FILE", "LOCKED_FILE_TYPE")
+    return Launch(
+        unlock_at=unlock_at,
+        locked_reply=locked or load_invalid_reply(env),
+        welcome_text=env.get("WELCOME_RESPONSE") or DEFAULT_WELCOME_TEXT,
+        venue_video=_load_reply(env, "VENUE_VIDEO_CAPTION", "VENUE_VIDEO", "VENUE_VIDEO_TYPE"),
+        website_url=website_url,
+    )
+
+
 def _required_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -288,6 +405,7 @@ async def main() -> None:
         token=token,
         responses=load_passkey_responses(),
         invalid_reply=load_invalid_reply(),
+        launch=load_launch(),
     )
     await bot.run()
 

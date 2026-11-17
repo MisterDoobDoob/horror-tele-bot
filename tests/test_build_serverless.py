@@ -41,6 +41,28 @@ class BuildServerlessTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_build_config_launch(self) -> None:
+        env = {
+            "PASSKEY_1": "alpha",
+            "RESPONSE_1": "A",
+            "UNLOCK_AT": "2026-11-18T14:00:00+08:00",
+            "LOCKED_RESPONSE": "Locked.",
+            "WELCOME_RESPONSE": "Welcome.",
+            "VENUE_VIDEO": "https://x/venue.mp4",
+            "WEBSITE_URL": "https://example.com",
+        }
+        config = await build_config(env, {})
+        self.assertEqual(
+            config["launch"],
+            {
+                "unlockAt": 1795413600000,  # 2026-11-18T06:00:00Z
+                "locked": {"text": "Locked."},
+                "welcome": "Welcome.",
+                "venueVideo": {"file": "https://x/venue.mp4", "type": "video"},
+                "websiteUrl": "https://example.com",
+            },
+        )
+
     async def test_local_file_requires_upload_chat(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
             env = {"PASSKEY_1": "a", "FILE_1": tmp.name, "TELEGRAM_BOT_TOKEN": "1:x"}
