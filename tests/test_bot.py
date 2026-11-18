@@ -1,18 +1,33 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 from bot import (
     CAPTION_LIMIT,
+    VENUE_VIDEO_BUTTON,
+    VENUE_VIDEO_CALLBACK,
+    WEBSITE_BUTTON,
+    Launch,
     Reply,
     TelegramPasskeyBot,
     _encode_multipart,
     detect_file_type,
     load_env_file,
     load_invalid_reply,
+    load_launch,
     load_passkey_responses,
+)
+
+UNLOCK_AT = datetime(2026, 11, 18, 14, tzinfo=timezone(timedelta(hours=8)))
+LAUNCH = Launch(
+    unlock_at=UNLOCK_AT,
+    locked_reply=Reply(text="Locked."),
+    welcome_text="Welcome.",
+    venue_video=Reply(file="https://x/venue.mp4"),
+    website_url="https://example.com",
 )
 
 
@@ -21,8 +36,14 @@ class StubBot(TelegramPasskeyBot):
         super().__init__(token="token", responses=responses, **kwargs)
         self.sent = []
 
-    async def send_message(self, chat_id: int, text: str) -> None:
-        self.sent.append(("text", chat_id, text))
+    async def send_message(self, chat_id: int, text: str, reply_markup=None) -> None:
+        if reply_markup:
+            self.sent.append(("text", chat_id, text, reply_markup))
+        else:
+            self.sent.append(("text", chat_id, text))
+
+    async def answer_callback_query(self, callback_query_id: str) -> None:
+        self.sent.append(("answer", callback_query_id))
 
     async def send_file(
         self, chat_id: int, file: str, file_type: str, caption: str | None = None
@@ -75,6 +96,83 @@ class PasskeyBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             bot.sent, [("file", 123, "f.pdf", "document", None), ("text", 123, long_text)]
         )
+
+
+def _launch_bot(now: datetime, launch: Launch = LAUNCH) -> StubBot:
+    return StubBot({"alpha": Reply(text="A")}, launch=launch, clock=lambda: now)
+
+
+BEFORE = UNLOCK_AT - timedelta(seconds=1)
+
+
+class LaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_reply_is_locked_before_unlock(self) -> None:
+        bot = _launch_bot(BEFORE)
+        await bot.handle_update(_update(1, "wrong"))
+        await bot.handle_update(_update(2, "alpha"))  # real passkeys still work
+        self.assertEqual(bot.sent, [("text", 123, "Locked."), ("text", 123, "A")])
+
+    async def test_normal_invalid_reply_from_unlock(self) -> None:
+        bot = _launch_bot(UNLOCK_AT)
+        await bot.handle_update(_update(1, "wrong"))
+        await bot.handle_update(_update(2, "/start"))
+        self.assertEqual(bot.sent, [("text", 123, "Invalid passkey ❌")] * 2)
+
+    async def test_start_shows_welcome_buttons(self) -> None:
+        bot = _launch_bot(BEFORE)
+        await bot.handle_update(_update(1, "/start"))
+        markup = {
+            "inline_keyboard": [
+                [{"text": VENUE_VIDEO_BUTTON, "callback_data": VENUE_VIDEO_CALLBACK}],
+                [{"text": WEBSITE_BUTTON, "url": "https://example.com"}],
+            ]
+        }
+        self.assertEqual(bot.sent, [("text", 123, "Welcome.", markup)])
+
+    async def test_start_without_buttons(self) -> None:
+        launch = Launch(unlock_at=UNLOCK_AT, locked_reply=Reply(text="L"), welcome_text="W")
+        bot = _launch_bot(BEFORE, launch)
+        await bot.handle_update(_update(1, "/start@SomeBot"))
+        self.assertEqual(bot.sent, [("text", 123, "W")])
+
+    async def test_venue_button_sends_video(self) -> None:
+        bot = _launch_bot(BEFORE)
+        query = {"id": "q1", "data": VENUE_VIDEO_CALLBACK, "message": {"chat": {"id": 123}}}
+        await bot.handle_update({"update_id": 9, "callback_query": query})
+        self.assertEqual(
+            bot.sent, [("answer", "q1"), ("file", 123, "https://x/venue.mp4", "video", None)]
+        )
+        self.assertEqual(bot._offset, 10)
+
+
+class LaunchConfigTests(unittest.TestCase):
+    def test_load_launch(self) -> None:
+        env = {
+            "UNLOCK_AT": "2026-11-18T14:00:00+08:00",
+            "LOCKED_RESPONSE": "Locked.",
+            "WELCOME_RESPONSE": "Welcome.",
+            "VENUE_VIDEO": "https://x/venue.mp4",
+            "WEBSITE_URL": "https://example.com",
+        }
+        self.assertEqual(load_launch(env), LAUNCH)
+
+    def test_locked_reply_falls_back_to_invalid(self) -> None:
+        launch = load_launch({"UNLOCK_AT": "2026-11-18T06:00:00Z", "INVALID_RESPONSE": "no"})
+        self.assertEqual(launch.locked_reply, Reply(text="no"))
+        self.assertEqual(launch.unlock_at, UNLOCK_AT)
+        self.assertIsNone(launch.welcome_markup())
+
+    def test_unset_unlock_disables_launch(self) -> None:
+        self.assertIsNone(load_launch({"LOCKED_RESPONSE": "x"}))
+
+    def test_bad_launch_settings_raise(self) -> None:
+        for env in (
+            {"UNLOCK_AT": "tomorrow"},
+            {"UNLOCK_AT": "2026-11-18T14:00:00"},  # no timezone
+            {"UNLOCK_AT": "2026-11-18T14:00:00+08:00", "WEBSITE_URL": "example.com"},
+        ):
+            with self.subTest(env=env), self.assertRaises(RuntimeError):
+                load_launch(env)
 
 
 class ConfigTests(unittest.TestCase):

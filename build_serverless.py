@@ -25,6 +25,7 @@ from bot import (
     _resolve_local_file,
     load_env_file,
     load_invalid_reply,
+    load_launch,
     load_passkey_responses,
 )
 
@@ -108,11 +109,16 @@ def render_config(config: dict[str, Any]) -> str:
 async def build_config(env: Mapping[str, str], cache: dict) -> dict[str, Any]:
     responses = load_passkey_responses(env)
     invalid = load_invalid_reply(env)
+    launch = load_launch(env)
+
+    all_replies = [*responses.values(), invalid]
+    if launch:
+        all_replies.append(launch.locked_reply)
+        if launch.venue_video:
+            all_replies.append(launch.venue_video)
 
     uploader = None
-    needs_upload = any(
-        r.file and _resolve_local_file(r.file) for r in (*responses.values(), invalid)
-    )
+    needs_upload = any(r.file and _resolve_local_file(r.file) for r in all_replies)
     if needs_upload:
         token = env.get("TELEGRAM_BOT_TOKEN")
         chat_id = (env.get("UPLOAD_CHAT_ID") or "").strip()
@@ -124,12 +130,23 @@ async def build_config(env: Mapping[str, str], cache: dict) -> dict[str, Any]:
         bot = TelegramPasskeyBot(token=token, responses={})
         uploader = FileUploader(bot, token.split(":", 1)[0], chat_id, cache)
 
-    return {
+    config: dict[str, Any] = {
         "responses": {
             passkey: await _serialize_reply(reply, uploader) for passkey, reply in responses.items()
         },
         "invalid": await _serialize_reply(invalid, uploader),
     }
+    if launch:
+        config["launch"] = {
+            "unlockAt": int(launch.unlock_at.timestamp() * 1000),  # epoch ms, for Date.now()
+            "locked": await _serialize_reply(launch.locked_reply, uploader),
+            "welcome": launch.welcome_text,
+            "venueVideo": (
+                await _serialize_reply(launch.venue_video, uploader) if launch.venue_video else None
+            ),
+            "websiteUrl": launch.website_url,
+        }
+    return config
 
 
 def main() -> None:
